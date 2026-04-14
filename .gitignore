@@ -1,4 +1,5 @@
 .venv/
+venv/
 data/*.csv
 data/*.pkl
 data/*.parquet
