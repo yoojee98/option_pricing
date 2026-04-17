@@ -16,19 +16,34 @@ CACHE_FILE = os.path.join(CACHE_DIR, "spy_options.parquet")
 
 # ── Market constants ──────────────────────────────────────────────────────────
 TICKER = "SPY"
-RISK_FREE_RATE = 0.05      # Approximate annualized risk-free rate (T-bill proxy)
-DIVIDEND_YIELD = 0.013     # SPY annualized dividend yield (~1.3%)
+RISK_FREE_RATE_FALLBACK = 0.04  # Used only if ^IRX fetch fails
+DIVIDEND_YIELD = 0.013          # SPY annualized dividend yield (~1.3%)
 
 # ── Option type constants ─────────────────────────────────────────────────────
 CALL = "call"
 PUT = "put"
 
 # ── Filter thresholds ─────────────────────────────────────────────────────────
-MIN_MONEYNESS = 0.80       # K/S lower bound
-MAX_MONEYNESS = 1.20       # K/S upper bound
-MAX_SPREAD_RATIO = 0.15    # (Ask - Bid) / Mid
-MIN_VOLUME = 10            # Minimum volume (falls back to open_interest if absent)
+MAX_LOG_MONEYNESS = 0.1823  # |log(K/S)| upper bound ≈ log(1.20), symmetric for calls & puts
+MAX_SPREAD_RATIO = 0.15    # (Ask - Bid) / Ask  (ask as denominator handles bid=0 quotes)
+MIN_LIQUIDITY = 1           # volume >= 1  OR  open_interest >= 1
 MIN_TTM_DAYS = 7           # Minimum days to expiration
+
+
+def _fetch_risk_free_rate() -> float:
+    """
+    Return the current annualized risk-free rate from the 3-month T-bill yield (^IRX).
+    ^IRX is quoted as a percentage (e.g. 3.61), so divide by 100.
+    Falls back to RISK_FREE_RATE_FALLBACK if the fetch fails.
+    """
+    try:
+        hist = yf.Ticker("^IRX").history(period="5d")
+        if hist.empty:
+            raise ValueError("Empty ^IRX history")
+        return float(hist["Close"].iloc[-1]) / 100.0
+    except Exception:
+        print(f"[data_loader] ^IRX fetch failed, using fallback r={RISK_FREE_RATE_FALLBACK:.2%}")
+        return RISK_FREE_RATE_FALLBACK
 
 
 def _fetch_spot_price(ticker: str = TICKER) -> float:
@@ -82,20 +97,24 @@ def _apply_filters(df: pd.DataFrame, spot: float) -> pd.DataFrame:
         "impliedVolatility": "iv_yf",
     })
 
-    required = ["strike", "bid", "ask", "last_price"]
+    required = ["strike", "ask", "last_price"]
     df = df.dropna(subset=required)
-    df = df[(df["bid"] > 0) & (df["ask"] > 0) & (df["last_price"] > 0)]
+    df = df[(df["ask"] > 0) & (df["last_price"] > 0)]
+    df = df[df["bid"].fillna(0) <= df["ask"]]  # drop inverted quotes
 
     df["moneyness"] = df["strike"] / spot
-    df = df[(df["moneyness"] >= MIN_MONEYNESS) & (df["moneyness"] <= MAX_MONEYNESS)]
+    df["log_moneyness"] = np.log(df["moneyness"])
+    df = df[df["log_moneyness"].abs() <= MAX_LOG_MONEYNESS]
 
-    df["mid"] = (df["bid"] + df["ask"]) / 2.0
-    df["spread_ratio"] = (df["ask"] - df["bid"]) / df["mid"]
+    # Use ask as denominator so bid=0 quotes are handled correctly
+    df["mid"] = (df["bid"].fillna(0) + df["ask"]) / 2.0
+    df["spread_ratio"] = (df["ask"] - df["bid"].fillna(0)) / df["ask"]
     df = df[df["spread_ratio"] <= MAX_SPREAD_RATIO]
 
-    # Prefer volume; fall back to open_interest if volume column is absent
-    vol_col = "volume" if "volume" in df.columns else "open_interest"
-    df = df[df[vol_col].fillna(0) >= MIN_VOLUME]
+    # Accept if volume >= 1 OR open_interest >= 1
+    vol = df["volume"].fillna(0)
+    oi = df["open_interest"].fillna(0)
+    df = df[(vol >= MIN_LIQUIDITY) | (oi >= MIN_LIQUIDITY)]
 
     # Vectorized TTM: avoid per-row Python calls
     today = pd.Timestamp("today").normalize()
@@ -105,14 +124,16 @@ def _apply_filters(df: pd.DataFrame, spot: float) -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 
-def _add_derived_fields(df: pd.DataFrame, spot: float) -> pd.DataFrame:
+def _add_derived_fields(df: pd.DataFrame, spot: float, r: float) -> pd.DataFrame:
     """Add model-ready columns: spot, r, q, log_moneyness, market_price."""
     df = df.copy()
     df["spot"] = spot
-    df["r"] = RISK_FREE_RATE
+    df["r"] = r
     df["q"] = DIVIDEND_YIELD
-    df["log_moneyness"] = np.log(df["moneyness"])   # reuse already-computed moneyness
+    df["log_moneyness"] = np.log(df["moneyness"])
     df["market_price"] = df["mid"]
+    # yfinance fills iv_yf with 0.00001 when it cannot converge; treat as missing
+    df.loc[df["iv_yf"] < 0.001, "iv_yf"] = np.nan
     return df
 
 
@@ -146,7 +167,8 @@ def load_option_data(
 
     print(f"[data_loader] Fetching live option chain for {TICKER}...")
     spot = _fetch_spot_price()
-    print(f"[data_loader] Spot price: {spot:.2f}")
+    r = _fetch_risk_free_rate()
+    print(f"[data_loader] Spot price: {spot:.2f}  |  Risk-free rate (^IRX): {r:.2%}")
 
     raw = _fetch_raw_chain()
     print(f"[data_loader] Raw rows fetched: {len(raw)}")
@@ -154,7 +176,7 @@ def load_option_data(
     filtered = _apply_filters(raw, spot)
     print(f"[data_loader] Rows after filtering: {len(filtered)}")
 
-    enriched = _add_derived_fields(filtered, spot)
+    enriched = _add_derived_fields(filtered, spot, r)
 
     if use_cache:
         os.makedirs(CACHE_DIR, exist_ok=True)
@@ -189,7 +211,8 @@ def get_expiry_list(df: pd.DataFrame) -> list[str]:
 
 # ── CLI smoke test ────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    data = load_option_data(use_cache=False)
+    # data = load_option_data(use_cache=False)
+    data = load_option_data(use_cache=False,force_refresh=True)
     print("\nSample rows:")
     print(data[["option_type", "expiry", "strike", "mid", "ttm", "moneyness", "iv_yf"]].head(10).to_string(index=False))
     print(f"\nTotal: {len(data)} contracts | Expiries: {len(get_expiry_list(data))}")
